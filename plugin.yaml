@@ -1,0 +1,9 @@
+name: prism
+version: 1.0
+description: "Prism — 中文优先的多模态记忆系统（HRR 结构化推理 + 语义嵌入 + 三路融合检索）"
+# v1.0.7：显式声明 standalone 绕过 hermes 通用 PluginManager 的
+# auto-coerce-to-exclusive 启发，让 /prism slash 命令能注册到 REPL；
+# memory provider 注册路径不受影响（memory loader 看的是源码字符串，不看 kind）。
+kind: standalone
+hooks:
+  - on_memory_write

@@ -1,0 +1,8 @@
+name: prism
+version: 1.0.10
+description: "Prism — 中文优先的多模态记忆系统（HRR 结构化推理 + 语义嵌入 + 三路融合检索）"
+# 与仓库根 plugin.yaml 保持一致（hermes installer 读的是根那份；本份是仓库
+# 自描述）。v1.0.7：kind: standalone 让 /prism slash 命令可注册。
+kind: standalone
+hooks:
+  - on_memory_write

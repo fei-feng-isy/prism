@@ -1,0 +1,100 @@
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ─── Virtualenv ───
+.venv/
+venv/
+env/
+ENV/
+
+# ─── Testing / coverage ───
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+.benchmarks/
+
+# ─── Type checkers ───
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# ─── Editors / IDE ───
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ─── Project-specific ───
+# Prism runtime data — never commit user memory DBs
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/
+logs/
+.prism/
+
+# Models (downloaded on demand)
+models/
+*.bin
+*.safetensors
+
+# Local config overrides
+config.local.yaml
+.env
+.env.local
+
+# Test artifacts
+tests/reports/eval-*.json
+bench.json
+# 注意：tests/reports/_baseline.json 是评估回归门（Phase 0.7 起归档），必须入库
+
+# Generated docs
+docs/_build/
+site/
+
+# Lock files
+uv.lock
+
+# Per-developer tool configs
+.codewhale/
+.cursor/
+.cursorrules
+.cursorignore
+.claude/
+.deepseek/
+.aider*
+.codeium/
+.windsurfrules
+.github-copilot*
+.gemini/
+reasonix.toml
+AGENTS.md
