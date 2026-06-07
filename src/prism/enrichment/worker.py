@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from prism.enrichment.queue import EnrichmentQueue, QueueItem
 
@@ -65,8 +66,18 @@ class EnrichmentWorker:
 
     def _process(self, item: QueueItem) -> None:
         try:
-            extracted = self._extractor(item.content)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self._extractor, item.content)
+                extracted = future.result(timeout=self._timeout_seconds)
             entities = [str(e).strip() for e in extracted if str(e).strip()]
+        except FuturesTimeoutError:
+            log.warning(
+                "enrichment 抽取超时 fact_id=%s timeout=%.1fs",
+                item.fact_id,
+                self._timeout_seconds,
+            )
+            self._queue.mark_failed(item.fact_id, f"extract: timeout after {self._timeout_seconds}s")
+            return
         except Exception as exc:
             log.warning(
                 "enrichment 抽取异常 fact_id=%s attempt=%s: %s",

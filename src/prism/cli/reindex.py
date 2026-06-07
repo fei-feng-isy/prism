@@ -25,7 +25,7 @@ from prism.config import (
     resolve_db_path_for_user,
 )
 from prism.db import bootstrap
-from prism.service.repair_service import _rebuild_vstore
+from prism.service.repair_service import rebuild_vstore
 
 if TYPE_CHECKING:
     from prism.semantic import SemanticBackend
@@ -170,7 +170,7 @@ def reindex(
                 log.warning("UPDATE fact_id=%s 失败：%s", fact_id, e)
 
     # 3) 重建 vstore：从最新 facts.semantic_vector 全量重建
-    vstore_rebuilt = _rebuild_vstore(
+    vstore_rebuilt = rebuild_vstore(
         db, vstore_path=vstore_path, dim=target_dim, new_model=new_model
     )
 

@@ -283,6 +283,8 @@ def _days_since_last_decay(conn: sqlite3.Connection, now: datetime) -> int:
         return 1
     try:
         last = datetime.fromisoformat(str(row["value"]))
+        if last.tzinfo is not None:
+            last = last.replace(tzinfo=None)
     except (ValueError, TypeError):
         log.warning(
             "prism_stats[%s] 不是合法 ISO 时间字符串：%r，按 1 天衰减",

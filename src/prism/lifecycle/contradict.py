@@ -127,7 +127,12 @@ def detect_contradiction(
     if overlap < overlap_min:
         return 0.0
 
-    sim = float(np.dot(vec_a, vec_b))
+    norm_a = np.linalg.norm(vec_a)
+    norm_b = np.linalg.norm(vec_b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    sim = float(np.dot(vec_a, vec_b) / (norm_a * norm_b))
+    sim = max(-1.0, min(1.0, sim))
     if sim >= sim_max:
         return 0.0
 

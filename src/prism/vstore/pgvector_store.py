@@ -83,7 +83,8 @@ class PgVectorStore:
         if create_schema:
             self._create_schema()
 
-        # _size 是本地缓存，假设单进程独占该表（Prism 单 user 单进程模型）
+        self._conn.execute(f"SET hnsw.ef_search = {self._ef_search}")
+
         self._size: int = self._count_from_db()
 
     # ─── core operations ─────────────────────────────────────────────────
@@ -138,9 +139,6 @@ class PgVectorStore:
         q = self._validate_and_cast(query)
         # pgvector cosine: <=> 算子返回距离（0 = identical, 2 = opposite）
         # similarity = 1 - distance，与 LocalNumpyVectorStore 的 dot product 对齐
-        # SET LOCAL 让 ef_search 仅对当前事务生效（autocommit 模式下即本次查询）
-        self._conn.execute(f"SET LOCAL hnsw.ef_search = {self._ef_search}")
-
         if filter_fact_ids is None:
             sql = (
                 f"SELECT fact_id, 1 - (embedding <=> %s) AS score "

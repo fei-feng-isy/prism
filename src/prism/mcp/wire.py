@@ -152,11 +152,13 @@ class PrismRuntime:
 
 def _make_calibrate_callback(
     bank: IncrementalBank,
-    db: sqlite3.Connection,
+    db_path: str,
     hrr_dim: int,
 ) -> Callable[[], None]:
     """生成 :class:`RebuildDebouncer` 回调：触发时按 bank 内 categories 全量
     校准（重新从 active facts 的 hrr_vector 计算 z_sum），防 z_sum 漂移。
+
+    回调在 Timer 线程执行，因此内部打开独立的 SQLite 连接避免跨线程访问。
     """
     import numpy as np
 
@@ -166,24 +168,29 @@ def _make_calibrate_callback(
         except Exception as e:
             log.warning("calibrate 取 categories 失败：%s", e)
             return
-        for category in cats:
-            try:
-                rows = db.execute(
-                    "SELECT hrr_vector FROM facts "
-                    "WHERE status='active' AND category=? AND hrr_vector IS NOT NULL",
-                    (category,),
-                ).fetchall()
-                vectors: list[np.ndarray] = []
-                for row in rows:
-                    blob = row["hrr_vector"]
-                    if blob is None:
-                        continue
-                    v = np.frombuffer(blob, dtype=np.float64)
-                    if v.shape[0] == hrr_dim:
-                        vectors.append(v)
-                bank.calibrate(category, vectors)
-            except Exception as e:
-                log.warning("calibrate category=%s 失败：%s", category, e)
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            for category in cats:
+                try:
+                    rows = conn.execute(
+                        "SELECT hrr_vector FROM facts "
+                        "WHERE status='active' AND category=? AND hrr_vector IS NOT NULL",
+                        (category,),
+                    ).fetchall()
+                    vectors: list[np.ndarray] = []
+                    for row in rows:
+                        blob = row["hrr_vector"]
+                        if blob is None:
+                            continue
+                        v = np.frombuffer(blob, dtype=np.float64)
+                        if v.shape[0] == hrr_dim:
+                            vectors.append(v)
+                    bank.calibrate(category, vectors)
+                except Exception as e:
+                    log.warning("calibrate category=%s 失败：%s", category, e)
+        finally:
+            conn.close()
 
     return _cb
 
@@ -275,7 +282,7 @@ def build_runtime(opts: RuntimeOptions | None = None, **kwargs: Any) -> PrismRun
     # 6) enrichment queue + RebuildDebouncer
     queue = EnrichmentQueue(db)
     debouncer = RebuildDebouncer(
-        _make_calibrate_callback(bank, db, cfg.hrr.dim),
+        _make_calibrate_callback(bank, str(db_path), cfg.hrr.dim),
         window_seconds=opts.bank_window_seconds,
     )
 

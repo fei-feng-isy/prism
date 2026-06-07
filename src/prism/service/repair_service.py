@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-__all__ = ["RepairService"]
+__all__ = ["RepairService", "rebuild_vstore"]
 
 _CONTENT_PREVIEW_LEN: Final[int] = 120
 _QUEUE_ITEMS_CAP: Final[int] = 100
@@ -162,20 +162,25 @@ class RepairService:
                             row["fact_id"], e,
                         )
 
-        with self._db:
+        self._db.execute("BEGIN")
+        try:
             cleared = self._db.execute(
                 "UPDATE facts SET enrichment_status = 'done', "
                 "updated_at = CURRENT_TIMESTAMP "
                 "WHERE enrichment_status = 'pending'"
             ).rowcount
             q_deleted = self._db.execute("DELETE FROM enrichment_queue").rowcount
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
 
         db_path_str = self._db_path()
         vstore_path: Path | None = None
         if db_path_str != ":memory:":
             vstore_path = Path(db_path_str).with_suffix(".vstore.npz")
 
-        vstore_rebuilt = _rebuild_vstore(
+        vstore_rebuilt = rebuild_vstore(
             self._db,
             vstore_path=vstore_path,
             dim=sem.dim,
@@ -215,7 +220,7 @@ class RepairService:
         return int(row[0]) if row else 0
 
 
-def _rebuild_vstore(
+def rebuild_vstore(
     db: sqlite3.Connection,
     *,
     vstore_path: Path | None,

@@ -180,12 +180,13 @@ class LLMClient:
 
     def close(self) -> None:
         """关闭 httpx 连接池；幂等。"""
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception:
-                pass
-            self._client = None
+        with self._client_lock:
+            if self._client is not None:
+                try:
+                    self._client.close()
+                except Exception:
+                    pass
+                self._client = None
 
     def _lazy_client(self) -> Any:
         if self._client is not None:

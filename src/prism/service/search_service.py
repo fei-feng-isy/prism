@@ -72,8 +72,8 @@ class SearchService:
             for r in results
         ]
 
-    def search_markdown(self, query: str) -> str:
-        return self._prefetch.prefetch(query)
+    def search_markdown(self, query: str, *, limit: int | None = None) -> str:
+        return self._prefetch.prefetch(query, limit=limit)
 
     # ─── probe ───────────────────────────────────────────────────────────
 

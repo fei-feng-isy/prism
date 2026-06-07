@@ -86,7 +86,8 @@ class FactService:
         category: str | None = None,
     ) -> FactResult:
         row = self._db.execute(
-            "SELECT content FROM facts WHERE fact_id = ?", (fact_id,)
+            "SELECT content, category, mirror_source FROM facts WHERE fact_id = ?",
+            (fact_id,),
         ).fetchone()
         if row is None:
             raise LookupError(f"fact_id={fact_id} 不存在")
@@ -94,11 +95,15 @@ class FactService:
         metadata: dict[str, Any] = {"supersedes_id": fact_id}
         if category is not None:
             metadata["category"] = category
+        elif row["category"] is not None:
+            metadata["category"] = row["category"]
+
+        original_source = str(row["mirror_source"]) if row["mirror_source"] else MIRROR_SOURCE_BUILTIN
 
         result = self._mirror.mirror_replace(
             content=content,
             metadata=metadata,
-            source=MIRROR_SOURCE_BUILTIN,
+            source=original_source,
             target="memory",
         )
         if result is None:
@@ -298,13 +303,18 @@ class FactService:
         if str(row["status"]) == "active":
             return RestoreResult(fact_id=fact_id, restored=False, category=category)
 
-        with self._db:
+        self._db.execute("BEGIN")
+        try:
             self._db.execute(
                 "UPDATE facts SET status = 'active', "
                 "archived_at = NULL, archive_reason = NULL "
                 "WHERE fact_id = ?",
                 (fact_id,),
             )
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
 
         if category is not None:
             self._restore_vectors(

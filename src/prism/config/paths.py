@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from pathlib import Path
 from typing import Final
 
@@ -81,6 +82,8 @@ def resolve_db_path(
         user_hash: 例如对 user_id 取 SHA-256 前 12 hex
         data_home: 数据根目录覆盖；None 时用 ``cfg.data_home_default``
     """
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", profile):
+        raise ValueError(f"profile contains unsafe characters: {profile!r}")
     home = data_home if data_home is not None else cfg.data_home_default
     raw = cfg.path_template.format(
         data_home=home,

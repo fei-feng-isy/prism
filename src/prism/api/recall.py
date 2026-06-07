@@ -58,7 +58,7 @@ class PrismRecall:
                     "as_markdown=True 时不支持 category/min_trust 过滤；"
                     "请用 as_markdown=False 走结构化路径"
                 )
-            return self._svc.search_markdown(query)
+            return self._svc.search_markdown(query, limit=limit)
 
         hits = self._svc.search(
             query, category=category, limit=limit, min_trust=min_trust

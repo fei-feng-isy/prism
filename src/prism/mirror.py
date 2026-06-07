@@ -297,9 +297,9 @@ class PrismMirror:
             )
             return None
 
-        # 校验旧 fact 存在 + 取旧 content（用于同内容 no-op 检测）
         old_row = self._conn.execute(
-            "SELECT content, status FROM facts WHERE fact_id = ?",
+            "SELECT content, status, category, hrr_vector FROM facts "
+            "WHERE fact_id = ?",
             (old_fact_id,),
         ).fetchone()
         if old_row is None:
@@ -338,6 +338,20 @@ class PrismMirror:
             supersedes_id=old_fact_id,
             archive_old_if_active=(old_status == "active"),
         )
+
+        if is_new:
+            old_category = str(old_row["category"]) if old_row["category"] else category
+            if old_row["hrr_vector"] is not None:
+                try:
+                    old_vec = np.frombuffer(old_row["hrr_vector"], dtype=np.float64)
+                    if old_vec.shape == (self._dim,):
+                        self._bank.remove(old_category, old_vec)
+                except Exception as e:
+                    log.warning("mirror_replace: bank.remove 旧向量失败 fact_id=%s: %s", old_fact_id, e)
+            try:
+                self._vstore.remove(old_fact_id)
+            except Exception as e:
+                log.debug("mirror_replace: vstore.remove 旧向量跳过 fact_id=%s: %s", old_fact_id, e)
 
         if is_new:
             self._bank.add(category, fact_vector)
@@ -559,28 +573,35 @@ class PrismMirror:
             本次归档的 fact 数量
         """
         archived = 0
-        rows = self._conn.execute(
-            "SELECT fact_id, content FROM facts "
-            "WHERE status = 'active' AND mirror_source = ? "
-            "ORDER BY fact_id LIMIT ?",
-            (mirror_source, batch_size),
-        ).fetchall()
-        for row in rows:
-            fid = int(row["fact_id"])
-            content = str(row["content"])
-            try:
-                alive = bool(is_alive(content))
-            except Exception as e:
-                log.warning(
-                    "archive_ghost_facts: is_alive 抛 fact_id=%s: %s — 跳过",
-                    fid, e,
-                )
-                continue
-            if alive:
-                continue
-            result = self.mirror_remove(fact_id=fid, reason=reason)
-            if result is not None:
-                archived += 1
+        last_id = 0
+        while True:
+            rows = self._conn.execute(
+                "SELECT fact_id, content FROM facts "
+                "WHERE status = 'active' AND mirror_source = ? "
+                "AND fact_id > ? ORDER BY fact_id LIMIT ?",
+                (mirror_source, last_id, batch_size),
+            ).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                fid = int(row["fact_id"])
+                last_id = fid
+                content = str(row["content"])
+                try:
+                    alive = bool(is_alive(content))
+                except Exception as e:
+                    log.warning(
+                        "archive_ghost_facts: is_alive 抛 fact_id=%s: %s — 跳过",
+                        fid, e,
+                    )
+                    continue
+                if alive:
+                    continue
+                result = self.mirror_remove(fact_id=fid, reason=reason)
+                if result is not None:
+                    archived += 1
+            if len(rows) < batch_size:
+                break
         return archived
 
     def _locate_old_fact(self, meta: Mapping[str, Any]) -> int | None:
@@ -770,7 +791,7 @@ class PrismMirror:
             self._conn.execute(
                 "UPDATE facts SET semantic_vector = ?, embedding_model = ? "
                 "WHERE fact_id = ?",
-                (vec.tobytes(), self._semantic.backend_name, fact_id),
+                (vec.tobytes(), self._semantic.name, fact_id),
             )
         except sqlite3.Error as e:
             log.warning("更新 facts.semantic_vector 失败 fact_id=%s: %s", fact_id, e)

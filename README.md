@@ -105,7 +105,6 @@ hermes
 ```
 # 与hermes 对话，输入：
 加载.hermes/prism/目录下的skill
-
 # hermes加载完成后，输入：
 首次安装prism
 ```

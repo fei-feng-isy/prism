@@ -86,7 +86,7 @@ class SmartPrefetch:
 
     # ─── 公共入口 ────────────────────────────────────────────────────────
 
-    def prefetch(self, query: str) -> str:
+    def prefetch(self, query: str, *, limit: int | None = None) -> str:
         """按 query 走融合 recall 并格式化为 markdown 注入片段。
 
         Args:
@@ -103,7 +103,8 @@ class SmartPrefetch:
         if self._is_cold_start():
             return ""
 
-        results = self._pipeline.recall(query, k=self._max_results)
+        k = limit if limit is not None else self._max_results
+        results = self._pipeline.recall(query, k=k)
         if not results:
             return ""
 

@@ -46,7 +46,7 @@ def _format_list_table(rows: list[dict[str, Any]]) -> str:
     headers = ("fact_id", "category", "status", "mirror_source", "content")
     widths = {
         "fact_id": max(len(headers[0]), max(len(str(r["fact_id"])) for r in rows)),
-        "category": max(len(headers[1]), max(len(r["category"]) for r in rows)),
+        "category": max(len(headers[1]), max(len(r["category"] or "") for r in rows)),
         "status": max(len(headers[2]), max(len(r["status"]) for r in rows)),
         "mirror_source": max(
             len(headers[3]), max(len(r["mirror_source"]) for r in rows)

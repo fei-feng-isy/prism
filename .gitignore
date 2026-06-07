@@ -84,17 +84,9 @@ site/
 # Lock files
 uv.lock
 
-# Per-developer tool configs
+# Per-developer tool configs (Claude / Cursor / Codewhale / DeepSeek / Reasonix)
 .codewhale/
 .cursor/
-.cursorrules
-.cursorignore
 .claude/
 .deepseek/
-.aider*
-.codeium/
-.windsurfrules
-.github-copilot*
-.gemini/
 reasonix.toml
-AGENTS.md

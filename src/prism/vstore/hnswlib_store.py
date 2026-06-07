@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Final
@@ -81,6 +82,7 @@ class HnswlibVectorStore:
 
         self._deleted_ids: set[int] = set()
         self._present_ids: set[int] = set()
+        self._query_lock = threading.Lock()
 
         self._init_index(initial_max_elements)
 
@@ -151,16 +153,14 @@ class HnswlibVectorStore:
         else:
             target = min(k * _FILTER_OVERFETCH_FACTOR, n_present)
 
-        # 2) ef 必须 ≥ k（hnswlib 内部要求）
         eff_ef = max(self._ef, target)
-        self._index.set_ef(eff_ef)
-
-        try:
-            labels, dists = self._index.knn_query(q.reshape(1, -1), k=target)
-        except RuntimeError as e:
-            # "Cannot return the results in a contiguous 2D array" → 索引候选不够
-            log.debug("hnswlib knn_query 警告（candidates 不足）：%s", e)
-            return []
+        with self._query_lock:
+            self._index.set_ef(eff_ef)
+            try:
+                labels, dists = self._index.knn_query(q.reshape(1, -1), k=target)
+            except RuntimeError as e:
+                log.debug("hnswlib knn_query 警告（candidates 不足）：%s", e)
+                return []
 
         # hnswlib cosine 距离 = 1 - cos；分数 = 1 - dist
         out: list[tuple[int, float]] = []

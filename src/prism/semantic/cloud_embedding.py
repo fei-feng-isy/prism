@@ -253,12 +253,13 @@ class CloudEmbeddingBackend:
 
     def close(self) -> None:
         """关闭 httpx 连接池；幂等。"""
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception:  # pragma: no cover
-                pass
-            self._client = None
+        with self._client_lock:
+            if self._client is not None:
+                try:
+                    self._client.close()
+                except Exception:  # pragma: no cover
+                    pass
+                self._client = None
 
 
 def _l2_normalize(mat: np.ndarray) -> np.ndarray:
