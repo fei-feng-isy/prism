@@ -150,10 +150,8 @@ class SmartPrefetch:
         """
         if len(self._pipeline.vstore) > 0:
             return False
-        row = self._pipeline.db.execute(
-            "SELECT 1 FROM facts WHERE status = 'active' LIMIT 1"
-        ).fetchone()
-        return row is None
+        from prism.db import FactsRepository
+        return FactsRepository(self._pipeline.db).count_active() == 0
 
     def _format(self, results: list[RecallResult]) -> str:
         """按 entity-hit 与 semantic-only 分两组，渲染 markdown。"""

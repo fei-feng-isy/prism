@@ -89,21 +89,8 @@ class SearchService:
         if limit < 1:
             return []
 
-        params: list[Any] = [entity.strip()]
-        sql = (
-            "SELECT f.fact_id, f.content, f.category, f.trust_score "
-            "FROM facts f "
-            "JOIN fact_entities fe ON fe.fact_id = f.fact_id "
-            "JOIN entities e ON e.entity_id = fe.entity_id "
-            "WHERE e.name = ? AND f.status = 'active'"
-        )
-        if category is not None:
-            sql += " AND f.category = ?"
-            params.append(category)
-        sql += " ORDER BY f.fact_id DESC LIMIT ?"
-        params.append(int(limit))
-
-        rows = self._db.execute(sql, params).fetchall()
+        from prism.db import EntitiesRepository
+        rows = EntitiesRepository(self._db).get_fact_ids_by_entity(entity, category, limit)
         return [
             {
                 "fact_id": int(row["fact_id"]),
@@ -128,27 +115,8 @@ class SearchService:
         if not unique_names or limit < 1:
             return []
 
-        placeholders = ",".join("?" for _ in unique_names)
-        params: list[Any] = list(unique_names)
-        sql = (
-            "SELECT f.fact_id, f.content, f.category, f.trust_score "
-            "FROM facts f "
-            "JOIN fact_entities fe ON fe.fact_id = f.fact_id "
-            "JOIN entities e ON e.entity_id = fe.entity_id "
-            f"WHERE e.name IN ({placeholders}) AND f.status = 'active'"
-        )
-        if category is not None:
-            sql += " AND f.category = ?"
-            params.append(category)
-        sql += (
-            " GROUP BY f.fact_id "
-            "HAVING COUNT(DISTINCT e.entity_id) = ? "
-            "ORDER BY f.fact_id DESC LIMIT ?"
-        )
-        params.append(len(unique_names))
-        params.append(int(limit))
-
-        rows = self._db.execute(sql, params).fetchall()
+        from prism.db import EntitiesRepository
+        rows = EntitiesRepository(self._db).get_fact_ids_by_entities(unique_names, category, limit)
         return [
             {
                 "fact_id": int(row["fact_id"]),
@@ -173,27 +141,8 @@ class SearchService:
         if limit < 1:
             return []
 
-        anchor = entity.strip()
-        params: list[Any] = [anchor]
-        sql = (
-            "SELECT e2.name AS name, COUNT(*) AS co "
-            "FROM fact_entities fe1 "
-            "JOIN entities e1 ON e1.entity_id = fe1.entity_id "
-            "JOIN fact_entities fe2 ON fe2.fact_id = fe1.fact_id "
-            "JOIN entities e2 ON e2.entity_id = fe2.entity_id "
-            "JOIN facts f ON f.fact_id = fe1.fact_id "
-            "WHERE e1.name = ? AND e2.name != e1.name AND f.status = 'active'"
-        )
-        if category is not None:
-            sql += " AND f.category = ?"
-            params.append(category)
-        sql += (
-            " GROUP BY e2.name "
-            "ORDER BY co DESC, e2.name ASC LIMIT ?"
-        )
-        params.append(int(limit))
-
-        rows = self._db.execute(sql, params).fetchall()
+        from prism.db import EntitiesRepository
+        rows = EntitiesRepository(self._db).get_co_occurring_entities(entity, category, limit)
         return [
             CoOccurrence(entity=str(row["name"]), co_occurrence=int(row["co"]))
             for row in rows
@@ -236,11 +185,5 @@ class SearchService:
     ) -> set[int]:
         if not fact_ids:
             return set()
-        placeholders = ",".join("?" for _ in fact_ids)
-        sql = (
-            f"SELECT fact_id FROM facts "
-            f"WHERE fact_id IN ({placeholders}) AND trust_score >= ?"
-        )
-        params: list[Any] = [*fact_ids, float(min_trust)]
-        rows = self._db.execute(sql, params).fetchall()
-        return {int(row["fact_id"]) for row in rows}
+        from prism.db import FactsRepository
+        return FactsRepository(self._db).filter_ids_by_min_trust(fact_ids, min_trust)

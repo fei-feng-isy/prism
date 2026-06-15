@@ -85,20 +85,18 @@ class FactService:
         content: str,
         category: str | None = None,
     ) -> FactResult:
-        row = self._db.execute(
-            "SELECT content, category, mirror_source FROM facts WHERE fact_id = ?",
-            (fact_id,),
-        ).fetchone()
+        from prism.db import FactsRepository
+        row = FactsRepository(self._db).get_fact_by_id(fact_id)
         if row is None:
             raise LookupError(f"fact_id={fact_id} 不存在")
 
         metadata: dict[str, Any] = {"supersedes_id": fact_id}
         if category is not None:
             metadata["category"] = category
-        elif row["category"] is not None:
+        elif row.get("category") is not None:
             metadata["category"] = row["category"]
 
-        original_source = str(row["mirror_source"]) if row["mirror_source"] else MIRROR_SOURCE_BUILTIN
+        original_source = str(row.get("mirror_source", MIRROR_SOURCE_BUILTIN))
 
         result = self._mirror.mirror_replace(
             content=content,
@@ -169,30 +167,14 @@ class FactService:
             )
         effective_limit = min(limit, _LIST_HARD_CAP)
 
-        clauses: list[str] = []
-        params: list[Any] = []
-        if category is not None:
-            clauses.append("category = ?")
-            params.append(category)
-        if status is not None:
-            clauses.append("status = ?")
-            params.append(status)
-        if mirror_source is not None:
-            clauses.append("mirror_source = ?")
-            params.append(mirror_source)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-
-        sql = (
-            "SELECT fact_id, content, category, status, trust_score, "
-            "helpful_count, mirror_source, created_at, archived_at, archive_reason "
-            f"FROM facts{where} ORDER BY created_at DESC, fact_id DESC "
-            "LIMIT ? OFFSET ?"
+        from prism.db import FactsRepository
+        rows, truncated = FactsRepository(self._db).list_facts(
+            category=category,
+            status=status,
+            mirror_source=mirror_source,
+            limit=effective_limit,
+            offset=offset,
         )
-        rows = self._db.execute(
-            sql, (*params, effective_limit + 1, offset)
-        ).fetchall()
-        truncated = len(rows) > effective_limit
-        rows = rows[:effective_limit]
 
         facts = tuple(
             FactSummary(
@@ -230,23 +212,13 @@ class FactService:
         )
 
     def show(self, fact_id: int) -> FactDetail | None:
-        row = self._db.execute(
-            "SELECT fact_id, content, category, status, mirror_source, mirror_target, "
-            "supersedes_id, trust_score, helpful_count, retrieval_count, "
-            "archived_at, archive_reason, enrichment_status, created_at "
-            "FROM facts WHERE fact_id = ?",
-            (fact_id,),
-        ).fetchone()
+        from prism.db import FactsRepository, EntitiesRepository
+        row = FactsRepository(self._db).get_fact_by_id(fact_id)
         if row is None:
             return None
 
-        entity_rows = self._db.execute(
-            "SELECT e.name FROM fact_entities fe "
-            "JOIN entities e ON e.entity_id = fe.entity_id "
-            "WHERE fe.fact_id = ? ORDER BY e.name",
-            (fact_id,),
-        ).fetchall()
-        entities = tuple(str(r["name"]) for r in entity_rows)
+        entity_names = EntitiesRepository(self._db).get_entity_names_by_fact_id(fact_id)
+        entities = tuple(entity_names)
 
         return FactDetail(
             fact_id=int(row["fact_id"]),
@@ -279,10 +251,9 @@ class FactService:
         result = self._mirror.mirror_remove(fact_id=fact_id, reason=reason)
         archived = result is not None
         if not archived:
-            row = self._db.execute(
-                "SELECT status FROM facts WHERE fact_id = ?", (fact_id,)
-            ).fetchone()
-            if row is not None and str(row["status"]) == "archived":
+            from prism.db import FactsRepository
+            row = FactsRepository(self._db).get_fact_by_id(fact_id)
+            if row is not None and str(row.get("status")) == "archived":
                 archived = True
         return ArchiveResult(fact_id=fact_id, archived=archived, reason=reason)
 
@@ -290,27 +261,20 @@ class FactService:
         if not isinstance(fact_id, int) or fact_id <= 0:
             raise ValueError(f"fact_id 必须是正整数：{fact_id!r}")
 
-        row = self._db.execute(
-            "SELECT status, category, hrr_vector, semantic_vector "
-            "FROM facts WHERE fact_id = ?",
-            (fact_id,),
-        ).fetchone()
+        from prism.db import FactsRepository
+        repo = FactsRepository(self._db)
+        row = repo.get_fact_by_id(fact_id)
         if row is None:
             return RestoreResult(fact_id=fact_id, restored=False, category=None)
 
-        category = str(row["category"]) if row["category"] is not None else None
+        category = str(row.get("category")) if row.get("category") is not None else None
 
-        if str(row["status"]) == "active":
+        if str(row.get("status")) == "active":
             return RestoreResult(fact_id=fact_id, restored=False, category=category)
 
         self._db.execute("BEGIN")
         try:
-            self._db.execute(
-                "UPDATE facts SET status = 'active', "
-                "archived_at = NULL, archive_reason = NULL "
-                "WHERE fact_id = ?",
-                (fact_id,),
-            )
+            repo.restore_fact(fact_id)
             self._db.execute("COMMIT")
         except Exception:
             self._db.execute("ROLLBACK")

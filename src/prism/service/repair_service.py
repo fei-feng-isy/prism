@@ -45,34 +45,31 @@ class RepairService:
         self._semantic = semantic
 
     def enrichment_diagnose(self) -> EnrichmentDiagnosis:
-        queue_count = self._count("SELECT COUNT(*) FROM enrichment_queue")
+        from prism.db import EnrichmentQueueRepository, FactsRepository
 
-        status_rows = self._db.execute(
-            "SELECT enrichment_status, COUNT(*) AS cnt, "
-            "SUM(CASE WHEN semantic_vector IS NULL THEN 1 ELSE 0 END) AS null_vec "
-            "FROM facts GROUP BY enrichment_status"
-        ).fetchall()
+        enq_repo = EnrichmentQueueRepository(self._db)
+        facts_repo = FactsRepository(self._db)
+
+        queue_count = enq_repo.pending_count()
+
+        status_data = facts_repo.count_by_enrichment_status()
         status_distribution = tuple(
             EnrichmentStatusEntry(
-                enrichment_status=str(r["enrichment_status"]),
-                count=int(r["cnt"]),
-                null_vector=int(r["null_vec"]),
+                enrichment_status=status,
+                count=data["count"],
+                null_vector=data["null_vector"],
             )
-            for r in status_rows
+            for status, data in sorted(status_data.items())
         )
 
-        q_rows = self._db.execute(
-            "SELECT fact_id, attempts, last_error, enqueued_at, last_attempt_at "
-            "FROM enrichment_queue ORDER BY enqueued_at ASC LIMIT ?",
-            (_QUEUE_ITEMS_CAP,),
-        ).fetchall()
+        q_rows = enq_repo.list_items(_QUEUE_ITEMS_CAP)
         queue_items = tuple(
             QueueItem(
                 fact_id=int(r["fact_id"]),
                 attempts=int(r["attempts"]),
-                last_error=r["last_error"],
-                enqueued_at=str(r["enqueued_at"]) if r["enqueued_at"] else None,
-                last_attempt_at=str(r["last_attempt_at"]) if r["last_attempt_at"] else None,
+                last_error=r.get("last_error"),
+                enqueued_at=str(r["enqueued_at"]) if r.get("enqueued_at") else None,
+                last_attempt_at=str(r["last_attempt_at"]) if r.get("last_attempt_at") else None,
             )
             for r in q_rows
         )
@@ -112,10 +109,11 @@ class RepairService:
             "ORDER BY fact_id ASC"
         ).fetchall()
 
-        pending_count = self._count(
-            "SELECT COUNT(*) FROM facts WHERE enrichment_status = 'pending'"
-        )
-        queue_count = self._count("SELECT COUNT(*) FROM enrichment_queue")
+        from prism.db import FactsRepository, EnrichmentQueueRepository
+        facts_repo = FactsRepository(self._db)
+        enq_repo = EnrichmentQueueRepository(self._db)
+        pending_count = facts_repo.count_by_enrichment_status_simple('pending')
+        queue_count = enq_repo.pending_count()
 
         if dry_run:
             return EnrichmentFixResult(
@@ -145,14 +143,10 @@ class RepairService:
                     continue
                 for row, vec in zip(chunk, mat, strict=True):
                     try:
-                        self._db.execute(
-                            "UPDATE facts SET semantic_vector = ?, embedding_model = ? "
-                            "WHERE fact_id = ?",
-                            (
-                                vec.astype(np.float32).tobytes(),
-                                model_name,
-                                int(row["fact_id"]),
-                            ),
+                        facts_repo.upsert_semantic_vector(
+                            int(row["fact_id"]),
+                            vec.astype(np.float32).tobytes(),
+                            model_name,
                         )
                         embedded += 1
                     except Exception as e:
@@ -164,12 +158,8 @@ class RepairService:
 
         self._db.execute("BEGIN")
         try:
-            cleared = self._db.execute(
-                "UPDATE facts SET enrichment_status = 'done', "
-                "updated_at = CURRENT_TIMESTAMP "
-                "WHERE enrichment_status = 'pending'"
-            ).rowcount
-            q_deleted = self._db.execute("DELETE FROM enrichment_queue").rowcount
+            cleared = enq_repo.bulk_update_enrichment_status('pending', 'done')
+            q_deleted = enq_repo.clear_all()
             self._db.execute("COMMIT")
         except Exception:
             self._db.execute("ROLLBACK")

@@ -4,6 +4,8 @@
 enrichment_queue.mark_done。物理清除通过 :func:`purge_old_archived` 完成。
 
 所有操作幂等。
+
+v2: SQL 操作委托到 Repository 层。
 """
 
 from __future__ import annotations
@@ -17,6 +19,8 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Final
 
 import numpy as np
+
+from ..db import FactsRepository, ContradictionRepository
 
 if TYPE_CHECKING:
     from ..enrichment import EnrichmentQueue
@@ -124,17 +128,14 @@ def archive_fact(
           不动 ``archive_reason``）
         - ``None`` fact_id 不存在
     """
-    row = conn.execute(
-        "SELECT content, category, status, hrr_vector "
-        "FROM facts WHERE fact_id = ?",
-        (fact_id,),
-    ).fetchone()
+    facts = FactsRepository(conn)
+    row = facts.get_fact_by_id(fact_id)
     if row is None:
         log.warning("archive_fact: fact_id=%s 不存在", fact_id)
         return None
 
-    category = str(row["category"]) if row["category"] is not None else "general"
-    existing_status = str(row["status"])
+    category = str(row.get("category", "general"))
+    existing_status = str(row.get("status", "active"))
 
     if existing_status != "active":
         log.debug(
@@ -148,20 +149,7 @@ def archive_fact(
         )
 
     with _txn(conn):
-        if now is None:
-            conn.execute(
-                "UPDATE facts SET status = 'archived', "
-                "archived_at = CURRENT_TIMESTAMP, archive_reason = ? "
-                "WHERE fact_id = ? AND status = 'active'",
-                (reason, fact_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE facts SET status = 'archived', "
-                "archived_at = ?, archive_reason = ? "
-                "WHERE fact_id = ? AND status = 'active'",
-                (_to_iso(now), reason, fact_id),
-            )
+        facts.archive_fact(fact_id, reason, now=_to_iso(now) if now is not None else None)
 
     # 队列清理
     if enrichment_queue is not None:
@@ -173,9 +161,10 @@ def archive_fact(
             )
 
     # bank.remove + 去抖 calibrate
-    if bank is not None and row["hrr_vector"] is not None:
+    hrr_blob = row.get("hrr_vector")
+    if bank is not None and hrr_blob is not None:
         try:
-            vec = np.frombuffer(row["hrr_vector"], dtype=np.float64)
+            vec = np.frombuffer(hrr_blob, dtype=np.float64)
             if vec.shape == (bank.dim,):
                 bank.remove(category, vec)
             else:
@@ -206,7 +195,7 @@ def archive_fact(
     )
 
 
-# ─── TTL cron ─────────────────────────────────────────────────────────────
+# ─── TTL 批量归档 ──────────────────────────────────────────────────────────
 
 
 def archive_by_ttl(
@@ -218,35 +207,24 @@ def archive_by_ttl(
     enrichment_queue: EnrichmentQueue | None = None,
     batch_size: int = 500,
 ) -> list[int]:
-    """扫描 ``ttl_days > 0`` 且过期的 active fact，全部归档。
+    """扫描并归档所有 TTL 已到期的 active fact。
 
-    过期判定：``julianday(now) - julianday(created_at) > ttl_days``。
-    ``ttl_days = 0`` 视为不过期。
-
-    Args:
-        conn: 已 ``init_schema`` 的 SQLite 连接
-        now: 测试可注入；None 时用当前 UTC 时间
-        bank / debouncer / enrichment_queue: 透传到 :func:`archive_fact`
-        batch_size: 单批扫描上限（防一次拉全表）
+    仅处理 ``ttl_days > 0`` 的 fact；``created_at + ttl_days days <= now``
+    时触发归档（``archive_reason='ttl_expired'``）。
 
     Returns:
-        本次归档的 fact_id 列表（按扫描顺序，即 fact_id 升序）。空列表表示
-        无过期 fact。
+        本次归档的 fact_id 列表（按 fact_id 升序）。空列表表示无过期 fact。
     """
+    facts = FactsRepository(conn)
     actual_now = now if now is not None else _utcnow_naive()
     now_str = _to_iso(actual_now)
 
-    rows = conn.execute(
-        "SELECT fact_id FROM facts "
-        "WHERE status = 'active' AND ttl_days > 0 "
-        "AND julianday(?) - julianday(created_at) > ttl_days "
-        "ORDER BY fact_id LIMIT ?",
-        (now_str, batch_size),
-    ).fetchall()
+    ttl_ids = facts.get_expired_ttl_ids(now_str, batch_size=batch_size)
+    if not ttl_ids:
+        return []
 
     archived: list[int] = []
-    for row in rows:
-        fid = int(row["fact_id"])
+    for fid in ttl_ids:
         result = archive_fact(
             conn,
             fid,
@@ -258,74 +236,49 @@ def archive_by_ttl(
         )
         if result is not None and result.archived:
             archived.append(fid)
+            log.debug("TTL archived fact_id=%s", fid)
     return archived
 
 
-# ─── 90d 物理清除 cron ────────────────────────────────────────
+# ─── 物理清除 ───────────────────────────────────────────────────────────────
 
 
 def purge_old_archived(
     conn: sqlite3.Connection,
     *,
-    retention_days: int = 90,
     now: datetime | None = None,
+    retention_days: int = 90,
     vstore: VectorStore | None = None,
     batch_size: int = 500,
 ) -> PurgeResult:
-    """物理删除超过 ``retention_days`` 仍处于 archived 状态的 fact。
+    """物理删除超过保留期的 archived fact。
 
-    事务内解开 supersedes_id / loser_fact_id FK 后 DELETE，CASCADE 级联清理关联表。
-    vstore 清理在事务外逐条容错执行。
-
-    Args:
-        conn: 已 ``init_schema`` 的 SQLite 连接
-        retention_days: 保留窗口天数，默认 90（来自 ``LifecycleConfig.archive_after_days``）
-        now: 测试可注入；None 时用当前 UTC 时间
-        vstore: 注入后逐条调 ``vstore.remove(fact_id)`` 清向量存储
-        batch_size: 单批 SELECT/DELETE 上限
+    保留期 = ``archived_at + retention_days days <= now``。
+    利用 FK CASCADE 自动清理关联行；删除前先解除非级联 FK 引用。
 
     Returns:
-        :class:`PurgeResult`，含已删除条数与 fact_id 列表。
+        :class:`PurgeResult`，含本次删除的 fact 数及 ID 列表。
     """
+    facts = FactsRepository(conn)
+    ctl = ContradictionRepository(conn)
     actual_now = now if now is not None else _utcnow_naive()
     cutoff = _to_iso(actual_now)
 
-    rows = conn.execute(
-        "SELECT fact_id FROM facts "
-        "WHERE status = 'archived' AND archived_at IS NOT NULL "
-        "AND julianday(?) - julianday(archived_at) > ? "
-        "ORDER BY fact_id LIMIT ?",
-        (cutoff, int(retention_days), batch_size),
-    ).fetchall()
-
-    if not rows:
+    fact_ids = facts.get_purge_candidates(cutoff, retention_days, batch_size)
+    if not fact_ids:
         return PurgeResult(
             deleted_count=0,
-            deleted_fact_ids=tuple(),
+            deleted_fact_ids=(),
             cutoff=actual_now,
         )
 
-    fact_ids = tuple(int(r["fact_id"]) for r in rows)
-    placeholders = ",".join("?" * len(fact_ids))
-
     with _txn(conn):
         # 解开 supersedes_id 反向引用（FK 非级联）
-        conn.execute(
-            f"UPDATE facts SET supersedes_id = NULL "
-            f"WHERE supersedes_id IN ({placeholders})",
-            fact_ids,
-        )
+        facts.unlink_supersedes(fact_ids)
         # 解开 contradiction_log.loser_fact_id（FK 非级联）
-        conn.execute(
-            f"UPDATE contradiction_log SET loser_fact_id = NULL "
-            f"WHERE loser_fact_id IN ({placeholders})",
-            fact_ids,
-        )
+        ctl.unlink_loser_facts(fact_ids)
         # 物理删除（FK CASCADE 自动级联 fact_entities / enrichment_queue / contradiction_log.fact_a/b）
-        conn.execute(
-            f"DELETE FROM facts WHERE fact_id IN ({placeholders})",
-            fact_ids,
-        )
+        facts.delete_facts(fact_ids)
 
     # vstore 清理（事务外，逐条容错 — 失败不影响 DB 一致性）
     if vstore is not None:
@@ -338,23 +291,24 @@ def purge_old_archived(
                     fid, e,
                 )
 
+    log.info("purge 完成：删除 %d 条 archived fact（retention=%d 天，cutoff=%s）",
+             len(fact_ids), retention_days, cutoff)
+
     return PurgeResult(
         deleted_count=len(fact_ids),
-        deleted_fact_ids=fact_ids,
+        deleted_fact_ids=tuple(fact_ids),
         cutoff=actual_now,
     )
 
 
-# ─── 工具 ────────────────────────────────────────────────────────────────
+# ─── 工具 ────────────────────────────────────────────────────────────────────
 
 
 def _utcnow_naive() -> datetime:
-    """返回 naive UTC datetime（与 SQLite ``CURRENT_TIMESTAMP`` 同语义）。"""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _to_iso(dt: datetime) -> str:
-    """转 SQLite 友好 ``YYYY-MM-DD HH:MM:SS`` ISO 字符串。"""
     if dt.tzinfo is not None:
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -362,7 +316,7 @@ def _to_iso(dt: datetime) -> str:
 
 @contextmanager
 def _txn(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """``isolation_level=None`` 连接专用的轻量事务：成功 COMMIT / 异常 ROLLBACK。"""
+    """轻量事务上下文：成功 COMMIT / 异常 ROLLBACK。"""
     conn.execute("BEGIN")
     try:
         yield conn

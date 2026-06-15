@@ -6,6 +6,8 @@ jaccard 实体重叠 >= 0.5 且 cosine 相似度 < 0.4 时视为矛盾候选。
 :class:`ContradictDetector` 维护 ``recent_changed_ids``，每次 cron 做
 ``changed x corpus`` 增量对比。:func:`list_contradictions` 直查
 ``contradiction_log``。同一对幂等（``(min,max)`` 归一化 + 去重）。
+
+v2: SQL 操作委托到 Repository 层。
 """
 
 from __future__ import annotations
@@ -17,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
 import numpy as np
+
+from prism.db import EntitiesRepository, ContradictionRepository
 
 if TYPE_CHECKING:
     from ..vstore import VectorStore
@@ -217,89 +221,72 @@ class ContradictDetector:
                 contradictions_logged=0,
                 logged_pairs=(),
             )
+        existing = self._load_existing_open_pairs()
 
-        pairs_examined = 0
         logged: list[tuple[int, int, float]] = []
-        existing_pairs = self._load_existing_open_pairs()
+        pairs_examined = 0
 
-        for new_fact in changed:
-            new_vec = vectors.get(new_fact.fact_id)
-            if new_vec is None:
+        for c in changed:
+            vec_c = vectors.get(c.fact_id)
+            if vec_c is None:
                 continue
-            for existing in corpus:
-                if existing.fact_id == new_fact.fact_id:
+            for t in corpus:
+                if c.fact_id == t.fact_id:
                     continue
-                ex_vec = vectors.get(existing.fact_id)
-                if ex_vec is None:
+                # 归一化去重
+                a, b = _normalize_pair(c.fact_id, t.fact_id)
+                if (a, b) in existing:
+                    continue
+                vec_t = vectors.get(t.fact_id)
+                if vec_t is None:
                     continue
                 pairs_examined += 1
                 score = detect_contradiction(
-                    new_fact.entities,
-                    existing.entities,
-                    new_vec,
-                    ex_vec,
+                    c.entities, t.entities, vec_c, vec_t,
                     min_entities=self.min_entities,
                     overlap_min=self.overlap_min,
                     sim_max=self.sim_max,
                 )
-                if score < self.threshold:
-                    continue
-                a, b = _normalize_pair(new_fact.fact_id, existing.fact_id)
-                if (a, b) in existing_pairs:
-                    continue
-                self._log_contradiction(a, b, score)
-                existing_pairs.add((a, b))
-                logged.append((a, b, score))
+                if score >= self.threshold:
+                    self._log_contradiction(a, b, score)
+                    existing.add((a, b))
+                    logged.append((a, b, score))
 
         return ContradictResult(
             scanned_changed=len(changed),
             scanned_corpus=len(corpus),
             pairs_examined=pairs_examined,
             contradictions_logged=len(logged),
-            logged_pairs=tuple(sorted(logged, key=lambda t: (t[0], t[1]))),
+            logged_pairs=tuple(logged),
         )
-
-    # ─── 内部 ─────────────────────────────────────────────────────────────
 
     def _load_facts(self, fact_ids: list[int]) -> list[_FactRow]:
+        """按 fact_id 列表加载 fact（含实体名）。"""
         if not fact_ids:
             return []
-        placeholders = ",".join("?" for _ in fact_ids)
-        rows = self.conn.execute(
-            f"SELECT f.fact_id, e.name AS entity FROM facts f "
-            f"LEFT JOIN fact_entities fe ON fe.fact_id = f.fact_id "
-            f"LEFT JOIN entities e ON e.entity_id = fe.entity_id "
-            f"WHERE f.fact_id IN ({placeholders}) AND f.status = 'active'",
-            fact_ids,
-        ).fetchall()
-        return _group_entities(rows)
+        entities_repo = EntitiesRepository(self.conn)
+        rows = entities_repo.load_facts_with_entities(fact_ids, active_only=False, limit=len(fact_ids) + 1000)
+        return [
+            _FactRow(fact_id=r["fact_id"], entities=frozenset(r["entities"]))
+            for r in rows
+        ]
 
     def _load_active_corpus(self, limit: int) -> list[_FactRow]:
-        rows = self.conn.execute(
-            "SELECT f.fact_id, e.name AS entity FROM facts f "
-            "LEFT JOIN fact_entities fe ON fe.fact_id = f.fact_id "
-            "LEFT JOIN entities e ON e.entity_id = fe.entity_id "
-            "WHERE f.fact_id IN ("
-            "  SELECT fact_id FROM facts WHERE status = 'active' "
-            "  ORDER BY fact_id DESC LIMIT ?"
-            ")",
-            (int(limit),),
-        ).fetchall()
-        return _group_entities(rows)
+        """加载 active fact 语料（含实体名）。"""
+        entities_repo = EntitiesRepository(self.conn)
+        rows = entities_repo.load_active_corpus_with_entities(limit)
+        return [
+            _FactRow(fact_id=r["fact_id"], entities=frozenset(r["entities"]))
+            for r in rows
+        ]
 
     def _load_existing_open_pairs(self) -> set[tuple[int, int]]:
-        rows = self.conn.execute(
-            "SELECT fact_a, fact_b FROM contradiction_log WHERE resolved = 0"
-        ).fetchall()
-        return {
-            _normalize_pair(int(r["fact_a"]), int(r["fact_b"])) for r in rows
-        }
+        ctl = ContradictionRepository(self.conn)
+        return ctl.get_open_pairs()
 
     def _log_contradiction(self, fact_a: int, fact_b: int, score: float) -> None:
-        self.conn.execute(
-            "INSERT INTO contradiction_log (fact_a, fact_b, score) VALUES (?, ?, ?)",
-            (fact_a, fact_b, float(score)),
-        )
+        ctl = ContradictionRepository(self.conn)
+        ctl.log_contradiction(fact_a, fact_b, score)
 
 
 # ─── 直查（PrismRecall.contradict 路径）─────────────────────────────────
@@ -327,29 +314,13 @@ def list_contradictions(
         ``{contradiction_id, fact_a, fact_b, score, detected_at,
         content_a, content_b, category_a, category_b}``
     """
-    if limit < 1:
-        return []
-
-    params: list[Any] = [int(resolved)]
-    sql = (
-        "SELECT cl.id AS cid, cl.fact_a, cl.fact_b, cl.score, cl.detected_at, "
-        "       fa.content AS content_a, fb.content AS content_b, "
-        "       fa.category AS category_a, fb.category AS category_b "
-        "FROM contradiction_log cl "
-        "JOIN facts fa ON fa.fact_id = cl.fact_a "
-        "JOIN facts fb ON fb.fact_id = cl.fact_b "
-        "WHERE cl.resolved = ?"
+    ctl = ContradictionRepository(conn)
+    raw = ctl.list_contradictions(
+        resolved=resolved,
+        category=category,
+        threshold=threshold,
+        limit=limit,
     )
-    if threshold is not None:
-        sql += " AND cl.score >= ?"
-        params.append(float(threshold))
-    if category is not None:
-        sql += " AND (fa.category = ? OR fb.category = ?)"
-        params.extend([category, category])
-    sql += " ORDER BY cl.score DESC, cl.detected_at DESC LIMIT ?"
-    params.append(int(limit))
-
-    rows = conn.execute(sql, params).fetchall()
     return [
         {
             "contradiction_id": int(r["cid"]),
@@ -362,7 +333,7 @@ def list_contradictions(
             "category_a": str(r["category_a"]) if r["category_a"] else None,
             "category_b": str(r["category_b"]) if r["category_b"] else None,
         }
-        for r in rows
+        for r in raw
     ]
 
 
@@ -372,18 +343,3 @@ def list_contradictions(
 def _normalize_pair(a: int, b: int) -> tuple[int, int]:
     """``(min, max)`` 归一化：让 (a, b) 与 (b, a) 视为同一对。"""
     return (a, b) if a < b else (b, a)
-
-
-def _group_entities(rows: Iterable[sqlite3.Row]) -> list[_FactRow]:
-    """LEFT JOIN 行 → list[_FactRow]，按 fact_id 分组（无实体的 fact 也保留）。"""
-    grouped: dict[int, set[str]] = {}
-    for row in rows:
-        fid = int(row["fact_id"])
-        ent = row["entity"]
-        bucket = grouped.setdefault(fid, set())
-        if ent is not None:
-            bucket.add(str(ent))
-    return [
-        _FactRow(fact_id=fid, entities=frozenset(ents))
-        for fid, ents in sorted(grouped.items())
-    ]

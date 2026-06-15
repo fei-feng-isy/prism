@@ -317,22 +317,21 @@ class RetrievalPipeline:
             return {}
 
         # query 实体名 → entity_id
-        name_placeholders = ",".join("?" * len(query_names))
-        rows = self._db.execute(
-            f"SELECT entity_id FROM entities WHERE name IN ({name_placeholders})",
-            tuple(query_names),
-        ).fetchall()
-        query_eids: set[int] = {int(r["entity_id"]) for r in rows}
+        from prism.db import EntitiesRepository
+        entities_repo = EntitiesRepository(self._db)
+        name_map = entities_repo.get_entity_ids_by_names(query_names)
+        query_eids: set[int] = set(name_map.values())
         if not query_eids:
             return {}
 
         # 找含 ≥ 1 个 query entity 的 fact，再取它们的全部 entity_ids
-        eid_placeholders = ",".join("?" * len(query_eids))
+        eid_list = list(query_eids)
+        eid_placeholders = ",".join("?" * len(eid_list))
         rows = self._db.execute(
             f"SELECT fact_id, entity_id FROM fact_entities WHERE fact_id IN ("
             f"SELECT DISTINCT fact_id FROM fact_entities WHERE entity_id IN ({eid_placeholders})"
             f")",
-            tuple(query_eids),
+            tuple(eid_list),
         ).fetchall()
 
         fact_eids: dict[int, set[int]] = {}

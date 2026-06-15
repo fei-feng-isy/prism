@@ -7,6 +7,9 @@
     - 异常吞掉 + WARN：mirror 失败不阻塞调用方写入。
     - 幂等：``facts.content UNIQUE``，重复 add 返回 ``MirrorResult(is_new=False)``。
     - bank 纯内存，可由 ``calibrate(category, all_active_facts)`` 重建。
+
+v2: 所有 SQL 操作委托到 :class:`prism.db.FactsRepository` 和
+    :class:`prism.db.EntitiesRepository`。
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Final
 import numpy as np
 
 from .config import EntitiesConfig
+from .db import FactsRepository, EntitiesRepository
 from .entities.regex_extractor import extract_entities
 from .hrr import IncrementalBank, atom, bind, bundle
 from .semantic import SemanticUnavailable
@@ -85,6 +89,7 @@ class PrismMirror:
         entities_config: 可选；控制富化触发阈值
         rebuild_debouncer: 可选；注入后 ``mirror_remove`` 在 ``bank.remove``
             后调 ``schedule()``，去抖窗口合并连续 remove → 单次 calibrate
+        facts_repo / entities_repo: 可选的 Repository 实例；None 时自动从 conn 创建
 
     Raises:
         ValueError: ``bank.dim != hrr_dim``
@@ -102,6 +107,8 @@ class PrismMirror:
         enrichment_queue: EnrichmentQueue | None = None,
         entities_config: EntitiesConfig | None = None,
         rebuild_debouncer: RebuildDebouncer | None = None,
+        facts_repo: FactsRepository | None = None,
+        entities_repo: EntitiesRepository | None = None,
     ) -> None:
         if bank.dim != hrr_dim:
             raise ValueError(f"bank.dim={bank.dim} 与 hrr_dim={hrr_dim} 不一致")
@@ -114,6 +121,8 @@ class PrismMirror:
                 f"semantic.dim={semantic.dim} 与 vstore.dim={vstore.dim} 不一致"
             )
         self._conn = conn
+        self._facts = facts_repo if facts_repo is not None else FactsRepository(conn)
+        self._entities = entities_repo if entities_repo is not None else EntitiesRepository(conn)
         self._bank = bank
         self._dim: Final[int] = hrr_dim
         self._default_category: Final[str] = default_category
@@ -297,16 +306,12 @@ class PrismMirror:
             )
             return None
 
-        old_row = self._conn.execute(
-            "SELECT content, status, category, hrr_vector FROM facts "
-            "WHERE fact_id = ?",
-            (old_fact_id,),
-        ).fetchone()
+        old_row = self._facts.get_fact_by_id(old_fact_id)
         if old_row is None:
             log.warning("mirror_replace: 旧 fact_id=%s 不存在", old_fact_id)
             return None
         old_content = str(old_row["content"])
-        old_status = str(old_row["status"])
+        old_status = str(old_row.get("status", "active"))
 
         category = str(meta.get("category", self._default_category))
 
@@ -340,10 +345,11 @@ class PrismMirror:
         )
 
         if is_new:
-            old_category = str(old_row["category"]) if old_row["category"] else category
-            if old_row["hrr_vector"] is not None:
+            old_category = str(old_row.get("category", category))
+            old_hrr = old_row.get("hrr_vector")
+            if old_hrr is not None:
                 try:
-                    old_vec = np.frombuffer(old_row["hrr_vector"], dtype=np.float64)
+                    old_vec = np.frombuffer(old_hrr, dtype=np.float64)
                     if old_vec.shape == (self._dim,):
                         self._bank.remove(old_category, old_vec)
                 except Exception as e:
@@ -398,7 +404,7 @@ class PrismMirror:
                 ``reason`` 覆盖
             reason: ``archive_reason`` 列写入值，默认 ``'manual'``。常用：
                 ``'manual'``（用户显式删）、``'builtin_removed'``（内置 memory
-                镜像反向同步）、``'ghost'``（cron 兜底）
+                反向同步）、``'ghost'``（cron 兜底）
 
         Returns:
             ``MirrorResult(is_new=False, ...)`` 成功（无论 fact 是刚归档还是
@@ -413,17 +419,13 @@ class PrismMirror:
             )
             return None
 
-        row = self._conn.execute(
-            "SELECT content, category, status, hrr_vector "
-            "FROM facts WHERE fact_id = ?",
-            (target_id,),
-        ).fetchone()
+        row = self._facts.get_fact_by_id(target_id)
         if row is None:
             log.warning("mirror_remove: fact_id=%s 不存在", target_id)
             return None
 
-        existing_status = str(row["status"])
-        category = str(row["category"]) if row["category"] is not None else self._default_category
+        existing_status = str(row.get("status", "active"))
+        category = str(row.get("category", self._default_category))
         actual_reason = str(meta.get("reason", reason))
 
         # 已 archived：no-op（不动 archive_reason，不重启 debouncer）
@@ -440,12 +442,7 @@ class PrismMirror:
             )
 
         with _txn(self._conn):
-            self._conn.execute(
-                "UPDATE facts SET status = 'archived', "
-                "archived_at = CURRENT_TIMESTAMP, archive_reason = ? "
-                "WHERE fact_id = ? AND status = 'active'",
-                (actual_reason, target_id),
-            )
+            self._facts.archive_fact(target_id, actual_reason)
 
         # 清队列条目（避免 worker 处理幽灵 fact；pop_next 的 active guard 是兜底）
         if self._enrichment_queue is not None:
@@ -457,9 +454,10 @@ class PrismMirror:
                 )
 
         # bank.remove + 去抖 calibrate（注入了 debouncer 才走）
-        if self._rebuild_debouncer is not None and row["hrr_vector"] is not None:
+        hrr_blob = row.get("hrr_vector")
+        if self._rebuild_debouncer is not None and hrr_blob is not None:
             try:
-                vec = np.frombuffer(row["hrr_vector"], dtype=np.float64)
+                vec = np.frombuffer(hrr_blob, dtype=np.float64)
                 if vec.shape == (self._dim,):
                     self._bank.remove(category, vec)
                 else:
@@ -544,10 +542,7 @@ class PrismMirror:
         if c is None:
             c = meta.get("old_content")
         if isinstance(c, str) and c.strip():
-            row = self._conn.execute(
-                "SELECT fact_id FROM facts WHERE content = ?",
-                (c.strip(),),
-            ).fetchone()
+            row = self._facts.get_fact_by_content(c.strip())
             if row is not None:
                 return int(row["fact_id"])
         return None
@@ -575,12 +570,7 @@ class PrismMirror:
         archived = 0
         last_id = 0
         while True:
-            rows = self._conn.execute(
-                "SELECT fact_id, content FROM facts "
-                "WHERE status = 'active' AND mirror_source = ? "
-                "AND fact_id > ? ORDER BY fact_id LIMIT ?",
-                (mirror_source, last_id, batch_size),
-            ).fetchall()
+            rows = self._facts.get_active_facts_by_source(mirror_source, batch_size, last_id)
             if not rows:
                 break
             for row in rows:
@@ -611,10 +601,7 @@ class PrismMirror:
             return sid
         old = meta.get("old_content")
         if isinstance(old, str) and old.strip():
-            row = self._conn.execute(
-                "SELECT fact_id FROM facts WHERE content = ?",
-                (old.strip(),),
-            ).fetchone()
+            row = self._facts.get_fact_by_content(old.strip())
             if row is not None:
                 return int(row["fact_id"])
         return None
@@ -633,7 +620,7 @@ class PrismMirror:
     ) -> tuple[int, bool]:
         """事务内写 facts + entities + fact_entities；返回 (fact_id, is_new)。
 
-        - content UNIQUE 冲突走 ON CONFLICT IGNORE，定位现有 fact_id 返回
+        - content UNIQUE 冲突走 INSERT OR IGNORE，定位现有 fact_id 返回
         - 已存在的 fact 不更新 entity 链接（避免重复写入路径里污染历史关联）
         - ``supersedes_id`` 非空：新 fact 的 ``supersedes_id`` 列写入旧 fact_id；
           若 ``archive_old_if_active=True``，同一事务内将旧 fact 标记为
@@ -642,53 +629,29 @@ class PrismMirror:
           "新 fact 已写 + 旧 fact 仍 active" 的中间态。
         """
         with _txn(self._conn):
-            cur = self._conn.execute(
-                "INSERT OR IGNORE INTO facts "
-                "(content, category, hrr_vector, mirror_source, mirror_target, supersedes_id) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    content,
-                    category,
-                    fact_vector.tobytes(),
-                    source,
-                    target,
-                    supersedes_id,
-                ),
+            fact_id, is_new = self._facts.insert_fact(
+                content=content,
+                category=category,
+                hrr_vector=fact_vector.tobytes(),
+                mirror_source=source,
+                mirror_target=target,
+                supersedes_id=supersedes_id,
             )
-            if cur.rowcount == 0:
-                # content UNIQUE 命中现有
-                row = self._conn.execute(
-                    "SELECT fact_id FROM facts WHERE content = ?", (content,)
-                ).fetchone()
-                return int(row["fact_id"]), False
 
-            assert cur.lastrowid is not None
-            fact_id = int(cur.lastrowid)
+            if not is_new:
+                return fact_id, False
 
             # entities + fact_entities
-            for ent in entities:
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO entities "
-                    "(name, entity_type, extraction_method) VALUES (?, ?, ?)",
-                    (ent.name, ent.entity_type, ent.method),
-                )
-                ent_row = self._conn.execute(
-                    "SELECT entity_id FROM entities WHERE name = ?", (ent.name,)
-                ).fetchone()
-                # ent_row 一定存在：上面 INSERT OR IGNORE 后必能 SELECT 到
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
-                    (fact_id, int(ent_row["entity_id"])),
-                )
+            if entities:
+                name_tuples = [(e.name, e.entity_type, e.method) for e in entities]
+                ent_map = self._entities.ensure_entities(name_tuples)
+                eids = list(ent_map.values())
+                if eids:
+                    self._entities.link_entities_bulk(fact_id, eids)
 
             # 归档旧 fact（replace 路径）
             if supersedes_id is not None and archive_old_if_active:
-                self._conn.execute(
-                    "UPDATE facts SET status = 'archived', "
-                    "archived_at = CURRENT_TIMESTAMP, archive_reason = ? "
-                    "WHERE fact_id = ? AND status = 'active'",
-                    (_ARCHIVE_REASON_REPLACED, supersedes_id),
-                )
+                self._facts.archive_fact(supersedes_id, _ARCHIVE_REASON_REPLACED)
 
             return fact_id, True
 
@@ -738,20 +701,11 @@ class PrismMirror:
             return
 
         with _txn(self._conn):
-            for name in clean:
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO entities "
-                    "(name, entity_type, extraction_method) VALUES (?, ?, ?)",
-                    (name, "llm_extracted", "llm"),
-                )
-                row = self._conn.execute(
-                    "SELECT entity_id FROM entities WHERE name = ?", (name,)
-                ).fetchone()
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) "
-                    "VALUES (?, ?)",
-                    (fact_id, int(row["entity_id"])),
-                )
+            name_tuples = [(n, "llm_extracted", "llm") for n in clean]
+            ent_map = self._entities.ensure_entities(name_tuples)
+            eids = list(ent_map.values())
+            if eids:
+                self._entities.link_entities_bulk(fact_id, eids)
 
     # ─── semantic 索引 ──────────────────────────────────────────────────
 
@@ -791,7 +745,7 @@ class PrismMirror:
             self._conn.execute(
                 "UPDATE facts SET semantic_vector = ?, embedding_model = ? "
                 "WHERE fact_id = ?",
-                (vec.tobytes(), self._semantic.name, fact_id),
+                (vec.tobytes(), self._facts._consolidate_model(self._semantic.name), fact_id),
             )
         except sqlite3.Error as e:
             log.warning("更新 facts.semantic_vector 失败 fact_id=%s: %s", fact_id, e)
@@ -822,7 +776,7 @@ class PrismMirror:
         return bundle(bound_content, *bound_entities)
 
 
-# ─── 内部事务工具 ─────────────────────────────────────────────────────────
+# ─── 工具 ────────────────────────────────────────────────────────────────────
 
 
 @contextmanager

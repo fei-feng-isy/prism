@@ -224,14 +224,8 @@ class CallTracker:
         if not self._db or not fact_ids:
             return
         try:
-            placeholders = ",".join("?" for _ in fact_ids)
-            self._db.execute(
-                f"UPDATE facts SET retrieval_count = retrieval_count + 1, "
-                f"last_retrieved_at = CURRENT_TIMESTAMP "
-                f"WHERE fact_id IN ({placeholders})",
-                fact_ids,
-            )
-            self._db.commit()
+            from .db import FactsRepository
+            FactsRepository(self._db).increment_retrieval_count(fact_ids)
         except Exception as e:
             log.debug("retrieval_count 更新失败：%s", e)
 

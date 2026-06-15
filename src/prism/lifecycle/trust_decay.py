@@ -4,6 +4,8 @@
 采用全局周期衰减（``prism_stats`` 跟踪上次 run），衰减后低于阈值自动归档。
 
 反馈：helpful +0.05 / unhelpful -0.10（不对称，有反馈优于无反馈）。
+
+v2: SQL 操作委托到 Repository 层。
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Final, Literal
 
 from ..config import CategoryDecay, LifecycleConfig
+from ..db import FactsRepository, StatsRepository
 from .archive import (
     ARCHIVE_REASON_LOW_TRUST,
     archive_fact,
@@ -118,10 +121,12 @@ def apply_trust_decay(
     Returns:
         :class:`DecayResult`，含本次扫描 / 衰减 / 归档计数。
     """
+    facts = FactsRepository(conn)
+    stats = StatsRepository(conn)
     cfg = lifecycle if lifecycle is not None else LifecycleConfig()
     actual_now = now if now is not None else _utcnow_naive()
 
-    days = _days_since_last_decay(conn, actual_now)
+    days = _days_since_last_decay(stats, actual_now)
 
     rows = conn.execute(
         "SELECT fact_id, category, trust_score FROM facts WHERE status = 'active'"
@@ -140,10 +145,7 @@ def apply_trust_decay(
         new_trust = _compute_new_trust(current, decay_cfg, days)
 
         if new_trust != current:
-            conn.execute(
-                "UPDATE facts SET trust_score = ? WHERE fact_id = ?",
-                (new_trust, fid),
-            )
+            facts.update_trust_score(fid, new_trust)
             decayed += 1
 
         if new_trust < low_trust_threshold:
@@ -159,7 +161,7 @@ def apply_trust_decay(
             if result is not None and result.archived:
                 archived_ids.append(fid)
 
-    _write_last_decay(conn, actual_now)
+    _write_last_decay(stats, actual_now)
 
     return DecayResult(
         scanned=scanned,
@@ -197,44 +199,30 @@ def apply_feedback(
 
     Returns:
         ``FeedbackResult`` 成功；``None`` 表示 fact_id 不存在或 status != 'active'。
-
-    Raises:
-        ValueError: signal 不在 {'helpful', 'unhelpful'}
     """
     if signal not in ("helpful", "unhelpful"):
         raise ValueError(f"signal 必须是 'helpful' 或 'unhelpful'，实际：{signal!r}")
 
-    row = conn.execute(
-        "SELECT trust_score, helpful_count, status FROM facts WHERE fact_id = ?",
-        (fact_id,),
-    ).fetchone()
+    facts = FactsRepository(conn)
+    row = facts.get_active_fact(fact_id)
     if row is None:
-        log.warning("apply_feedback: fact_id=%s 不存在", fact_id)
+        log.warning("apply_feedback: fact_id=%s 不存在或非 active", fact_id)
         return None
 
-    if str(row["status"]) != "active":
-        log.debug(
-            "apply_feedback: fact_id=%s status=%s，跳过", fact_id, row["status"]
-        )
-        return None
-
-    current = float(row["trust_score"]) if row["trust_score"] is not None else 0.5
-    helpful_count = int(row["helpful_count"]) if row["helpful_count"] is not None else 0
+    current_trust = float(row.get("trust_score", 0.5))
+    current_helpful = int(row.get("helpful_count", 0))
 
     if signal == "helpful":
         delta = helpful_delta
-        new_trust = min(TRUST_SCORE_MAX, current + delta)
-        new_count = helpful_count + 1
+        new_trust = min(TRUST_SCORE_MAX, current_trust + delta)
+        new_count = current_helpful + 1
     else:
         delta = -unhelpful_delta
-        new_trust = max(TRUST_SCORE_MIN, current + delta)
-        new_count = helpful_count - 1
+        new_trust = max(TRUST_SCORE_MIN, current_trust + delta)
+        new_count = current_helpful - 1
 
     with _txn(conn):
-        conn.execute(
-            "UPDATE facts SET trust_score = ?, helpful_count = ? WHERE fact_id = ?",
-            (new_trust, new_count, fact_id),
-        )
+        facts.update_trust_and_helpful(fact_id, new_trust, new_count)
 
     return FeedbackResult(
         fact_id=fact_id,
@@ -245,7 +233,7 @@ def apply_feedback(
     )
 
 
-# ─── 内部工具 ────────────────────────────────────────────────────────────
+# ─── 内部 helpers ────────────────────────────────────────────────────────
 
 
 def _resolve_decay(cfg: LifecycleConfig, category: str) -> CategoryDecay:
@@ -257,52 +245,46 @@ def _resolve_decay(cfg: LifecycleConfig, category: str) -> CategoryDecay:
     return CategoryDecay()
 
 
-def _compute_new_trust(
-    current: float, decay_cfg: CategoryDecay, days: int
-) -> float:
-    """``new = max(min_floor, current * decay^days)``，已应用 [0, 1] 边界。"""
+def _compute_new_trust(current: float, cfg: CategoryDecay, days: int) -> float:
+    """逐天衰减：trust = max(floor, trust * decay_per_day ^ days)。"""
     if days <= 0:
-        # 同日内多次 run 不重复衰减
-        return _clamp(current)
-    factor = decay_cfg.decay_per_day ** days
-    raw = current * factor
-    floored = max(decay_cfg.min_trust_floor, raw)
-    return _clamp(floored)
+        return max(0.0, min(1.0, current))
+    if cfg.decay_per_day >= 1.0:
+        return max(0.0, min(1.0, current))
+    new_trust = current * (cfg.decay_per_day ** days)
+    return max(cfg.min_trust_floor, min(1.0, new_trust))
 
 
-def _clamp(v: float) -> float:
-    return max(TRUST_SCORE_MIN, min(TRUST_SCORE_MAX, v))
-
-
-def _days_since_last_decay(conn: sqlite3.Connection, now: datetime) -> int:
+def _days_since_last_decay(stats: StatsRepository, now: datetime) -> int:
     """从 ``prism_stats`` 读上次 run 时间；不存在 → 1（首次按 1 天衰减）。"""
-    row = conn.execute(
-        "SELECT value FROM prism_stats WHERE key = ?", (STATS_KEY_LAST_DECAY,)
-    ).fetchone()
-    if row is None:
+    last_str = stats.get(STATS_KEY_LAST_DECAY)
+    if last_str is None:
         return 1
     try:
-        last = datetime.fromisoformat(str(row["value"]))
+        last = datetime.fromisoformat(last_str)
         if last.tzinfo is not None:
             last = last.replace(tzinfo=None)
     except (ValueError, TypeError):
         log.warning(
             "prism_stats[%s] 不是合法 ISO 时间字符串：%r，按 1 天衰减",
-            STATS_KEY_LAST_DECAY, row["value"],
+            STATS_KEY_LAST_DECAY, last_str,
         )
         return 1
     delta_days = (now - last).days
     return max(0, delta_days)
 
 
-def _write_last_decay(conn: sqlite3.Connection, now: datetime) -> None:
+def _write_last_decay(stats: StatsRepository, now: datetime) -> None:
     """把本次 run 时间写入 ``prism_stats``（UPSERT）。"""
-    iso = now.replace(microsecond=0).isoformat(sep=" ")
-    conn.execute(
-        "INSERT INTO prism_stats (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
-        (STATS_KEY_LAST_DECAY, iso),
-    )
+    stats.set(STATS_KEY_LAST_DECAY, _to_iso(now))
+
+
+def _to_iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_iso(s: str) -> datetime:
+    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
 
 
 def _utcnow_naive() -> datetime:

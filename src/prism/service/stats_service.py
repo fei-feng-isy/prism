@@ -70,6 +70,8 @@ class StatsService:
         cfg = self._cfg
         sem_available = sem.is_available()
         sem_loaded = getattr(sem, "is_loaded", True)
+        from prism.db import EntitiesRepository
+        entities_repo = EntitiesRepository(self._db)
         return {
             "version": __version__,
             "db_path": self._db_path(),
@@ -89,63 +91,25 @@ class StatsService:
             "prefetch": {"warmed": self._prefetch.warmed},
             "retriever": self._retriever_stats(),
             "entities": {
-                "entities_count": self._count("SELECT COUNT(*) FROM entities"),
-                "fact_entities_count": self._count(
-                    "SELECT COUNT(*) FROM fact_entities"
-                ),
+                "entities_count": entities_repo.count_entities(),
+                "fact_entities_count": entities_repo.count_fact_entities(),
                 "distinct_embedding_models": count_distinct_embedding_models(self._db),
             },
         }
 
     def _facts_stats(self, category: str | None) -> dict[str, Any]:
-        if category is None:
-            active = self._count("SELECT COUNT(*) FROM facts WHERE status = 'active'")
-            archived = self._count(
-                "SELECT COUNT(*) FROM facts WHERE status = 'archived'"
-            )
-            total = self._count("SELECT COUNT(*) FROM facts")
-        else:
-            active = self._count(
-                "SELECT COUNT(*) FROM facts WHERE status = 'active' AND category = ?",
-                (category,),
-            )
-            archived = self._count(
-                "SELECT COUNT(*) FROM facts WHERE status = 'archived' AND category = ?",
-                (category,),
-            )
-            total = self._count(
-                "SELECT COUNT(*) FROM facts WHERE category = ?", (category,)
-            )
-
-        rows = self._db.execute(
-            "SELECT category, COUNT(*) AS n FROM facts WHERE status = 'active' "
-            "GROUP BY category ORDER BY n DESC"
-        ).fetchall()
-        by_category = {str(r["category"]): int(r["n"]) for r in rows}
-
+        from prism.db import FactsRepository
+        repo = FactsRepository(self._db)
         return {
-            "total": total,
-            "active": active,
-            "archived": archived,
-            "by_category": by_category,
+            "total": repo.count_total(category),
+            "active": repo.count_active(category),
+            "archived": repo.count_archived(category),
+            "by_category": repo.count_by_category(),
         }
 
     def _trust_stats(self) -> dict[str, Any]:
-        row = self._db.execute(
-            "SELECT AVG(trust_score) AS avg, "
-            "SUM(CASE WHEN trust_score > ? THEN 1 ELSE 0 END) AS high, "
-            "SUM(CASE WHEN trust_score >= ? AND trust_score <= ? THEN 1 ELSE 0 END) AS mid, "
-            "SUM(CASE WHEN trust_score < ? THEN 1 ELSE 0 END) AS low "
-            "FROM facts WHERE status = 'active'",
-            (_TRUST_HIGH_MIN, _TRUST_MID_MIN, _TRUST_HIGH_MIN, _TRUST_MID_MIN),
-        ).fetchone()
-        avg = row["avg"] if row and row["avg"] is not None else None
-        return {
-            "avg": float(avg) if avg is not None else None,
-            "high (>0.7)": int(row["high"] or 0) if row else 0,
-            "mid (0.3-0.7)": int(row["mid"] or 0) if row else 0,
-            "low (<0.3)": int(row["low"] or 0) if row else 0,
-        }
+        from prism.db import FactsRepository
+        return FactsRepository(self._db).get_trust_aggregates()
 
     def _banks_stats(self) -> dict[str, Any]:
         if self._bank is None:
@@ -160,22 +124,15 @@ class StatsService:
         }
 
     def _enrichment_stats(self) -> dict[str, int]:
-        return {
-            "pending": self._count("SELECT COUNT(*) FROM enrichment_queue"),
-            "done": self._count(
-                "SELECT COUNT(*) FROM facts WHERE enrichment_status = 'done'"
-            ),
-            "failed": self._count(
-                "SELECT COUNT(*) FROM facts WHERE enrichment_status = 'failed'"
-            ),
-        }
+        from prism.db import EnrichmentQueueRepository
+        return EnrichmentQueueRepository(self._db).stats()
 
     def _contradictions_stats(self) -> dict[str, int]:
+        from prism.db import ContradictionRepository
+        repo = ContradictionRepository(self._db)
         return {
-            "detected": self._count("SELECT COUNT(*) FROM contradiction_log"),
-            "unresolved": self._count(
-                "SELECT COUNT(*) FROM contradiction_log WHERE resolved = 0"
-            ),
+            "detected": repo.count_total(),
+            "unresolved": repo.count_unresolved(),
         }
 
     def _performance_stats(self) -> dict[str, Any]:
